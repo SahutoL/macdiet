@@ -16,6 +16,7 @@ macdiet は現在「サブコマンド型CLI（`doctor/scan/snapshots/fix/report
 - Phase 7 は実装済み（`/` で横断フィルタ: ReportView（所見/アクション/注記）/ Fix候補 / Logs一覧を絞り込み）
 - Phase 8 は実装済み（Utilities: doctor の所見に依存せず、allowlisted RUN_CMD を選択→typed confirm で実行）
 - Phase 9 は実装済み（個別削除: Fix画面の一部R2候補から「個別削除（ゴミ箱へ移動）」へ遷移し、候補の複数選択→typed confirm→TRASH_MOVE を実行）
+- Phase 10 は実装済み（Snapshots thin/delete: R3 を二段階 typed confirm で実行し、結果/ログ閲覧までTUIで完結）
 
 ## 1. 目的
 

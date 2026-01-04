@@ -7,6 +7,12 @@
 
 ## レビュー履歴
 
+### 2026-01-04: 最小一区切り（TUI Phase 10）
+
+- 実装: TUIから `snapshots thin/delete`（R3）を実行（最大リスク=R3ゲート + 二段階typed confirm + 結果/ログ表示）
+- UI/UX: ホームに `スナップショット thin/delete` を追加、ヘルプ/ドキュメント/READMEを追従
+- 安全: 既存方針を維持（ツール側の勝手なsudo昇格なし、ログ保存、`--dry-run` で破壊的操作無効）
+
 ### 2026-01-02: 初期セットアップ
 
 - 実施: エージェント運用ルールの整備（`AGENTS.md` / `rules.md`）、進捗管理テンプレ（`now-task.md` / `review.md`）

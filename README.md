@@ -7,7 +7,7 @@ macOSのストレージ肥大化、とくに「System Data（システムデー�
 ## できること（v0.1）
 
 - `doctor`: 開発者環境で頻出の肥大化要因（Xcode/Simulator/Docker/主要キャッシュ等）を根拠（Evidence）付きで推定し、上位を表示
-- `ui`: Claude Code風の対話UIで `doctor`/`scan --deep`/`snapshots status`/`fix`/`logs` を実行・閲覧（Phase 7: R1/TRASH_MOVE の適用 + allowlisted RUN_CMD の実行 + logs閲覧 + 横断フィルタ（`/`）。typed confirm必須）
+- `ui`: Claude Code風の対話UIで `doctor`/`scan --deep`/`snapshots status`/`snapshots thin/delete`/`fix`/`logs` を実行・閲覧（Phase 10: R1/TRASH_MOVE の適用 + allowlisted RUN_CMD の実行 + R2 個別削除 + R3 snapshots thin/delete + logs閲覧 + 横断フィルタ（`/`）。typed confirm必須）
 - `scan --deep`: 指定スコープを集計し、巨大ディレクトリのランキング（深さ制限付き）
 - `snapshots status`: Time Machine ローカルスナップショット / APFSスナップショットの状態を可能な範囲で表示（失敗時は未観測として可視化）
 - `snapshots thin`: ローカルスナップショットの thin（R3、TTY+二段階確認、`--dry-run` でプレビュー）
@@ -173,4 +173,4 @@ macdiet completion zsh > /usr/local/share/zsh/site-functions/_macdiet
 - `docs/system-data.md`: System Dataとは何か（一般カテゴリ）/ macdietの前提
 - `docs/snapshots.md`: ローカル/ APFS スナップショットの扱いと導線
 - `docs/report.md`: `report --markdown` の使い方と出力例
-- `docs/ui.md`: TUI（Claude Code風）UX仕様（案、Phase 6実装済）
+- `docs/ui.md`: TUI（Claude Code風）UX仕様（案、Phase 10実装済）

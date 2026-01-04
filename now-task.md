@@ -4,7 +4,7 @@
 
 ## 進行中（In Progress）
 
-- [ ] T73: TUIから snapshots thin/delete を実行（DoD: R3 の二段階確認をTUIに実装し、結果/ログ閲覧まで一連で完結。既存CLIの安全モデル（非TTY拒否/exit=20/ログ）を維持。`cargo test`）
+（空）
 
 ## 進行予定（Planned）
 
@@ -12,6 +12,7 @@
 
 ## 完了済み（Done）
 
+- [x] T73: TUIから snapshots thin/delete を実行（DoD: R3 の二段階確認をTUIに実装し、結果/ログ閲覧まで一連で完結。既存CLIの安全モデル（非TTY拒否/exit=20/ログ）を維持。`cargo test`）→ `src/tui/mod.rs`, `README.md`, `docs/ui.md`（`cargo test`）
 - [x] T78: コミット前のリポジトリ衛生チェック（DoD: 個人情報/端末依存/生成物/モック文言が混入していないことを確認し、必要な修正（例: `.gitignore`/テストデータの一般化）を適用。`cargo test`）→ `.gitignore`, `src/actions/mod.rs`, `src/tui/mod.rs`（`cargo test`）
 - [x] T77: Fix画面の操作ガイド（p/x/c）を初心者向けに改善（DoD: 上部ヒントとヘルプに `c` を含め、詳細ペインに「このアクションで使うキー」を表示する。可能なら Enter を「おすすめ操作」にして迷わず実行できる導線を追加。`cargo test`）→ `src/tui/mod.rs`, `docs/ui.md`（`cargo test`）
 - [x] T76: `docker system df` をTUI内で実行（DoD: `docker-storage-df` を allowlisted RUN_CMD として実行でき、結果/ログがTUIで確認できる。`cargo test`）→ `src/rules/mod.rs`, `src/actions/mod.rs`, `src/tui/mod.rs`（`cargo test`）

@@ -74,6 +74,12 @@ enum Screen {
     Home,
     Running,
     ScanConfig,
+    SnapshotsThinConfig,
+    SnapshotsThinConfirm,
+    SnapshotsThinResult,
+    SnapshotsDeleteSelect,
+    SnapshotsDeleteConfirm,
+    SnapshotsDeleteResult,
     LogsList,
     LogsDetail,
     ReportView,
@@ -118,6 +124,8 @@ enum CommandKind {
     Doctor,
     ScanDeep,
     SnapshotsStatus,
+    SnapshotsThin,
+    SnapshotsDelete,
     FixDryRun,
     Utilities,
     Logs,
@@ -219,6 +227,83 @@ struct FixRunCmdResult {
     return_to: Screen,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotsThinConfirmStage {
+    Thin,
+    Yes,
+}
+
+struct SnapshotsThinConfirm {
+    stage: SnapshotsThinConfirmStage,
+    input: String,
+    bytes: u64,
+    urgency: u8,
+    error: Option<String>,
+    return_to: Screen,
+    result_return_to: Screen,
+}
+
+struct SnapshotsThinResult {
+    bytes: u64,
+    urgency: u8,
+    cmd: String,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    log_path: Option<PathBuf>,
+    log_error: Option<String>,
+    return_to: Screen,
+}
+
+struct PendingSnapshotsThin {
+    rx: mpsc::Receiver<Result<SnapshotsThinResult>>,
+    started_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct SnapshotDeleteEntry {
+    uuid: String,
+    names: Vec<String>,
+    search_text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotsDeleteConfirmStage {
+    Delete,
+    Uuid,
+}
+
+struct SnapshotsDeleteConfirm {
+    stage: SnapshotsDeleteConfirmStage,
+    input: String,
+    uuid: String,
+    delete_cmd: String,
+    error: Option<String>,
+    return_to: Screen,
+    result_return_to: Screen,
+}
+
+struct SnapshotsDeleteResult {
+    requested_id: String,
+    resolved_uuid: Option<String>,
+    delete_cmd: String,
+    list_exit_code: Option<i32>,
+    delete_exit_code: Option<i32>,
+    error: Option<String>,
+    log_path: Option<PathBuf>,
+    log_error: Option<String>,
+    return_to: Screen,
+}
+
+struct PendingSnapshotsDeleteList {
+    rx: mpsc::Receiver<Result<Vec<SnapshotDeleteEntry>>>,
+    started_at: Instant,
+}
+
+struct PendingSnapshotsDelete {
+    rx: mpsc::Receiver<Result<SnapshotsDeleteResult>>,
+    started_at: Instant,
+}
+
 struct LogEntry {
     file_name: String,
     path: PathBuf,
@@ -248,6 +333,16 @@ struct App {
     scan_config_state: ListState,
     scan_edit_mode: bool,
     last_scan_request: Option<ScanRequest>,
+    snapshots_thin_bytes_input: String,
+    snapshots_thin_urgency_input: String,
+    snapshots_thin_state: ListState,
+    snapshots_thin_edit_mode: bool,
+    snapshots_thin_confirm: Option<SnapshotsThinConfirm>,
+    snapshots_thin_result: Option<SnapshotsThinResult>,
+    snapshots_delete_entries: Vec<SnapshotDeleteEntry>,
+    snapshots_delete_state: ListState,
+    snapshots_delete_confirm: Option<SnapshotsDeleteConfirm>,
+    snapshots_delete_result: Option<SnapshotsDeleteResult>,
     logs_entries: Vec<LogEntry>,
     logs_state: ListState,
     logs_view: Option<LogDetail>,
@@ -287,6 +382,9 @@ struct App {
     pending_cleanup: Option<PendingCleanup>,
     pending_apply: Option<PendingApply>,
     pending_run_cmd: Option<PendingRunCmd>,
+    pending_snapshots_thin: Option<PendingSnapshotsThin>,
+    pending_snapshots_delete_list: Option<PendingSnapshotsDeleteList>,
+    pending_snapshots_delete: Option<PendingSnapshotsDelete>,
 
     findings_state: ListState,
     actions_state: ListState,
@@ -322,6 +420,16 @@ impl App {
                 kind: CommandKind::SnapshotsStatus,
             },
             CommandItem {
+                title: "スナップショット thin（R3）",
+                description: "tmutil thinlocalsnapshots（強い同意が必要。必要なら sudo で実行）",
+                kind: CommandKind::SnapshotsThin,
+            },
+            CommandItem {
+                title: "スナップショット delete（R3）",
+                description: "diskutil apfs deleteSnapshot（強い同意が必要。必要なら sudo で実行）",
+                kind: CommandKind::SnapshotsDelete,
+            },
+            CommandItem {
                 title: "掃除（dry-run）",
                 description: "掃除アクションを確認し、R1/TRASH_MOVE を安全に適用（入力による確認）。",
                 kind: CommandKind::FixDryRun,
@@ -353,6 +461,12 @@ impl App {
 
         let mut scan_config_state = ListState::default();
         scan_config_state.select(Some(0));
+
+        let mut snapshots_thin_state = ListState::default();
+        snapshots_thin_state.select(Some(0));
+
+        let mut snapshots_delete_state = ListState::default();
+        snapshots_delete_state.select(Some(0));
 
         let mut logs_state = ListState::default();
         logs_state.select(Some(0));
@@ -391,6 +505,16 @@ impl App {
             scan_config_state,
             scan_edit_mode: false,
             last_scan_request: Some(default_scan_request),
+            snapshots_thin_bytes_input: "5GiB".to_string(),
+            snapshots_thin_urgency_input: "2".to_string(),
+            snapshots_thin_state,
+            snapshots_thin_edit_mode: false,
+            snapshots_thin_confirm: None,
+            snapshots_thin_result: None,
+            snapshots_delete_entries: Vec::new(),
+            snapshots_delete_state,
+            snapshots_delete_confirm: None,
+            snapshots_delete_result: None,
             logs_entries: Vec::new(),
             logs_state,
             logs_view: None,
@@ -426,6 +550,9 @@ impl App {
             pending_cleanup: None,
             pending_apply: None,
             pending_run_cmd: None,
+            pending_snapshots_thin: None,
+            pending_snapshots_delete_list: None,
+            pending_snapshots_delete: None,
             findings_state,
             actions_state,
             fix_state,
@@ -498,6 +625,7 @@ fn screen_supports_filter(screen: Screen) -> bool {
             | Screen::LogsList
             | Screen::Utilities
             | Screen::CleanupView
+            | Screen::SnapshotsDeleteSelect
     )
 }
 
@@ -696,6 +824,122 @@ fn run_app(
             }
         }
 
+        if let Some(pending) = app.pending_snapshots_delete_list.take() {
+            match pending.rx.try_recv() {
+                Ok(res) => match res {
+                    Ok(entries) => {
+                        app.snapshots_delete_entries = entries;
+                        app.snapshots_delete_state.select(Some(0));
+                        app.error = None;
+                        app.screen = Screen::SnapshotsDeleteSelect;
+                    }
+                    Err(err) => {
+                        open_error_return_to(&mut app, err.to_string(), Screen::Home);
+                    }
+                },
+                Err(mpsc::TryRecvError::Empty) => {
+                    if pending.started_at.elapsed() > Duration::from_secs(120) {
+                        open_error_return_to(
+                            &mut app,
+                            "スナップショット一覧の取得がタイムアウトしました。".to_string(),
+                            Screen::Home,
+                        );
+                    } else {
+                        app.pending_snapshots_delete_list = Some(pending);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    open_error_return_to(
+                        &mut app,
+                        "スナップショット一覧タスクとの接続が切れました。".to_string(),
+                        Screen::Home,
+                    );
+                }
+            }
+        }
+
+        if let Some(pending) = app.pending_snapshots_thin.take() {
+            match pending.rx.try_recv() {
+                Ok(res) => match res {
+                    Ok(result) => {
+                        app.snapshots_thin_result = Some(result);
+                        app.snapshots_thin_confirm = None;
+                        app.error = None;
+                        app.screen = Screen::SnapshotsThinResult;
+                    }
+                    Err(err) => {
+                        app.snapshots_thin_confirm = None;
+                        open_error_return_to(&mut app, err.to_string(), Screen::SnapshotsThinConfig);
+                    }
+                },
+                Err(mpsc::TryRecvError::Empty) => {
+                    if pending.started_at.elapsed() > Duration::from_secs(300) {
+                        app.snapshots_thin_confirm = None;
+                        open_error_return_to(
+                            &mut app,
+                            "snapshots thin の結果待ちがタイムアウトしました。処理はまだ進行中の可能性があります。"
+                                .to_string(),
+                            Screen::SnapshotsThinConfig,
+                        );
+                    } else {
+                        app.pending_snapshots_thin = Some(pending);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    app.snapshots_thin_confirm = None;
+                    open_error_return_to(
+                        &mut app,
+                        "snapshots thin タスクとの接続が切れました。処理が一部実行されている可能性があります。"
+                            .to_string(),
+                        Screen::SnapshotsThinConfig,
+                    );
+                }
+            }
+        }
+
+        if let Some(pending) = app.pending_snapshots_delete.take() {
+            match pending.rx.try_recv() {
+                Ok(res) => match res {
+                    Ok(result) => {
+                        app.snapshots_delete_result = Some(result);
+                        app.snapshots_delete_confirm = None;
+                        app.error = None;
+                        app.screen = Screen::SnapshotsDeleteResult;
+                    }
+                    Err(err) => {
+                        app.snapshots_delete_confirm = None;
+                        open_error_return_to(
+                            &mut app,
+                            err.to_string(),
+                            Screen::SnapshotsDeleteSelect,
+                        );
+                    }
+                },
+                Err(mpsc::TryRecvError::Empty) => {
+                    if pending.started_at.elapsed() > Duration::from_secs(300) {
+                        app.snapshots_delete_confirm = None;
+                        open_error_return_to(
+                            &mut app,
+                            "snapshots delete の結果待ちがタイムアウトしました。処理はまだ進行中の可能性があります。"
+                                .to_string(),
+                            Screen::SnapshotsDeleteSelect,
+                        );
+                    } else {
+                        app.pending_snapshots_delete = Some(pending);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    app.snapshots_delete_confirm = None;
+                    open_error_return_to(
+                        &mut app,
+                        "snapshots delete タスクとの接続が切れました。処理が一部実行されている可能性があります。"
+                            .to_string(),
+                        Screen::SnapshotsDeleteSelect,
+                    );
+                }
+            }
+        }
+
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout).context("イベント待ち")? {
             match event::read().context("イベント読み取り")? {
@@ -730,6 +974,12 @@ fn open_error_return_to(app: &mut App, msg: impl Into<String>, return_to: Screen
     app.error_return_to = match return_to {
         Screen::Home
         | Screen::ScanConfig
+        | Screen::SnapshotsThinConfig
+        | Screen::SnapshotsThinConfirm
+        | Screen::SnapshotsThinResult
+        | Screen::SnapshotsDeleteSelect
+        | Screen::SnapshotsDeleteConfirm
+        | Screen::SnapshotsDeleteResult
         | Screen::LogsList
         | Screen::LogsDetail
         | Screen::ReportView
@@ -855,6 +1105,8 @@ fn handle_key(app: &mut App, engine: &Engine, key: KeyEvent) -> Result<bool> {
                 if let Some(kind) = app.selected_command_kind() {
                     match kind {
                         CommandKind::ScanDeep => open_scan_config(app),
+                        CommandKind::SnapshotsThin => open_snapshots_thin_config(app),
+                        CommandKind::SnapshotsDelete => open_snapshots_delete_select(app, engine.timeout()),
                         CommandKind::Utilities => open_utilities(app),
                         CommandKind::Logs => open_logs(app),
                         _ => start_run(app, engine.clone(), kind),
@@ -908,6 +1160,151 @@ fn handle_key(app: &mut App, engine: &Engine, key: KeyEvent) -> Result<bool> {
                 _ => {}
             },
         },
+        Screen::SnapshotsThinConfig => match key.code {
+            _ if app.snapshots_thin_edit_mode => match key.code {
+                KeyCode::Enter | KeyCode::Esc => {
+                    app.snapshots_thin_edit_mode = false;
+                    trim_snapshots_thin_inputs(app);
+                }
+                KeyCode::Backspace => {
+                    snapshots_thin_field_mut(app).pop();
+                }
+                KeyCode::Char(c) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                    {
+                        snapshots_thin_field_mut(app).push(c);
+                    }
+                }
+                _ => {}
+            },
+            _ => match key.code {
+                KeyCode::Char('q') => return Ok(true),
+                KeyCode::Char('?') => open_help(app),
+                KeyCode::Char('b') | KeyCode::Esc => app.screen = Screen::Home,
+                KeyCode::Char('1') => app.fix_max_risk = RiskLevel::R1,
+                KeyCode::Char('2') => app.fix_max_risk = RiskLevel::R2,
+                KeyCode::Char('3') => app.fix_max_risk = RiskLevel::R3,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    App::move_list_selection(&mut app.snapshots_thin_state, 2, -1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    App::move_list_selection(&mut app.snapshots_thin_state, 2, 1)
+                }
+                KeyCode::Enter => app.snapshots_thin_edit_mode = true,
+                KeyCode::Char('x') => start_snapshots_thin_confirm(app)?,
+                _ => {}
+            },
+        },
+        Screen::SnapshotsThinConfirm => match key.code {
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('?') => open_help(app),
+            KeyCode::Esc => {
+                let return_to = app
+                    .snapshots_thin_confirm
+                    .as_ref()
+                    .map(|c| c.return_to)
+                    .unwrap_or(Screen::SnapshotsThinConfig);
+                app.snapshots_thin_confirm = None;
+                app.screen = return_to;
+            }
+            KeyCode::Backspace => {
+                if let Some(confirm) = app.snapshots_thin_confirm.as_mut() {
+                    confirm.input.pop();
+                }
+            }
+            KeyCode::Enter => submit_snapshots_thin_confirm(app, engine.timeout())?,
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    return Ok(false);
+                }
+                if let Some(confirm) = app.snapshots_thin_confirm.as_mut() {
+                    confirm.input.push(c);
+                }
+            }
+            _ => {}
+        },
+        Screen::SnapshotsThinResult => match key.code {
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('?') => open_help(app),
+            KeyCode::Char('b') | KeyCode::Esc => {
+                let return_to = app
+                    .snapshots_thin_result
+                    .as_ref()
+                    .map(|r| r.return_to)
+                    .unwrap_or(Screen::SnapshotsThinConfig);
+                app.screen = return_to;
+            }
+            KeyCode::Char('r') => open_snapshots_thin_config(app),
+            _ => {}
+        },
+        Screen::SnapshotsDeleteSelect => match key.code {
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('?') => open_help(app),
+            KeyCode::Char('b') | KeyCode::Esc => app.screen = Screen::Home,
+            KeyCode::Char('r') => start_snapshots_delete_list_refresh(app, engine.timeout()),
+            KeyCode::Char('1') => app.fix_max_risk = RiskLevel::R1,
+            KeyCode::Char('2') => app.fix_max_risk = RiskLevel::R2,
+            KeyCode::Char('3') => app.fix_max_risk = RiskLevel::R3,
+            KeyCode::Up | KeyCode::Char('k') => {
+                let indices =
+                    snapshots_delete_filtered_indices(&app.snapshots_delete_entries, &app.filter);
+                App::move_list_selection(&mut app.snapshots_delete_state, indices.len(), -1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let indices =
+                    snapshots_delete_filtered_indices(&app.snapshots_delete_entries, &app.filter);
+                App::move_list_selection(&mut app.snapshots_delete_state, indices.len(), 1);
+            }
+            KeyCode::Enter | KeyCode::Char('x') => start_snapshots_delete_confirm(app)?,
+            _ => {}
+        },
+        Screen::SnapshotsDeleteConfirm => match key.code {
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('?') => open_help(app),
+            KeyCode::Esc => {
+                let return_to = app
+                    .snapshots_delete_confirm
+                    .as_ref()
+                    .map(|c| c.return_to)
+                    .unwrap_or(Screen::SnapshotsDeleteSelect);
+                app.snapshots_delete_confirm = None;
+                app.screen = return_to;
+            }
+            KeyCode::Backspace => {
+                if let Some(confirm) = app.snapshots_delete_confirm.as_mut() {
+                    confirm.input.pop();
+                }
+            }
+            KeyCode::Enter => submit_snapshots_delete_confirm(app, engine.timeout())?,
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    return Ok(false);
+                }
+                if let Some(confirm) = app.snapshots_delete_confirm.as_mut() {
+                    confirm.input.push(c);
+                }
+            }
+            _ => {}
+        },
+        Screen::SnapshotsDeleteResult => match key.code {
+            KeyCode::Char('q') => return Ok(true),
+            KeyCode::Char('?') => open_help(app),
+            KeyCode::Char('b') | KeyCode::Esc => {
+                let return_to = app
+                    .snapshots_delete_result
+                    .as_ref()
+                    .map(|r| r.return_to)
+                    .unwrap_or(Screen::SnapshotsDeleteSelect);
+                app.screen = return_to;
+            }
+            KeyCode::Char('r') => start_snapshots_delete_list_refresh(app, engine.timeout()),
+            _ => {}
+        },
         Screen::LogsList => match key.code {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Char('?') => open_help(app),
@@ -943,11 +1340,18 @@ fn handle_key(app: &mut App, engine: &Engine, key: KeyEvent) -> Result<bool> {
         Screen::Running => match key.code {
             KeyCode::Char('q') => return Ok(true),
             KeyCode::Esc => {
-                if app.pending_apply.is_some() || app.pending_run_cmd.is_some() {
+                if app.pending_apply.is_some()
+                    || app.pending_run_cmd.is_some()
+                    || app.pending_snapshots_thin.is_some()
+                    || app.pending_snapshots_delete.is_some()
+                {
                     // Cannot cancel destructive work safely; ignore.
                 } else if app.pending_cleanup.is_some() {
                     app.pending_cleanup = None;
                     app.screen = app.cleanup_return_to;
+                } else if app.pending_snapshots_delete_list.is_some() {
+                    app.pending_snapshots_delete_list = None;
+                    app.screen = Screen::Home;
                 } else {
                     app.pending = None;
                     app.screen = Screen::Home;
@@ -1280,6 +1684,12 @@ fn start_run(app: &mut App, engine: Engine, kind: CommandKind) {
             CommandKind::Doctor => engine.doctor(),
             CommandKind::ScanDeep => engine.scan(scan_req.expect("スキャンリクエスト（内部）")),
             CommandKind::SnapshotsStatus => engine.snapshots_status(),
+            CommandKind::SnapshotsThin => Err(anyhow::anyhow!(
+                "内部エラー: Snapshots thin はレポート生成コマンドではありません"
+            )),
+            CommandKind::SnapshotsDelete => Err(anyhow::anyhow!(
+                "内部エラー: Snapshots delete はレポート生成コマンドではありません"
+            )),
             CommandKind::FixDryRun => engine.doctor(),
             CommandKind::Utilities => Err(anyhow::anyhow!(
                 "内部エラー: Utilities は実行対象のコマンドではありません"
@@ -2281,6 +2691,536 @@ fn start_fix_run_cmd(
     app.error = None;
 }
 
+fn start_snapshots_delete_list_refresh(app: &mut App, timeout: Duration) {
+    let (tx, rx) = mpsc::channel::<Result<Vec<SnapshotDeleteEntry>>>();
+    thread::spawn(move || {
+        let res = (|| -> Result<Vec<SnapshotDeleteEntry>> {
+            if timeout == Duration::from_secs(0) {
+                return Err(anyhow::anyhow!(
+                    "タイムアウト予算が 0 のため、diskutil を実行できません。"
+                ));
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = timeout;
+                return Err(anyhow::anyhow!("snapshots delete は macOS のみ対応です。"));
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let out = crate::platform::macos::diskutil_apfs_list_snapshots("/", timeout)
+                    .context("diskutil apfs listSnapshots の実行")?;
+                if out.exit_code != 0 {
+                    let mut msg = format!(
+                        "`diskutil apfs listSnapshots /` が失敗しました（exit_code={}）",
+                        out.exit_code
+                    );
+                    let stdout = out.stdout.trim();
+                    if !stdout.is_empty() {
+                        msg.push_str(&format!("\nstdout:\n{stdout}"));
+                    }
+                    let stderr = out.stderr.trim();
+                    if !stderr.is_empty() {
+                        msg.push_str(&format!("\nstderr:\n{stderr}"));
+                    }
+                    return Err(anyhow::anyhow!(msg));
+                }
+
+                let entries = build_snapshot_delete_entries(&out.stdout);
+                if entries.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "diskutil の出力からスナップショットUUIDを検出できませんでした。"
+                    ));
+                }
+                Ok(entries)
+            }
+        })();
+        let _ = tx.send(res);
+    });
+
+    app.pending_snapshots_delete_list = Some(PendingSnapshotsDeleteList {
+        rx,
+        started_at: Instant::now(),
+    });
+    app.screen = Screen::Running;
+    app.error = None;
+}
+
+fn start_snapshots_thin_confirm(app: &mut App) -> Result<()> {
+    if app.dry_run {
+        open_error_return_to(
+            app,
+            "dry-run モード: snapshots thin は無効です。".to_string(),
+            Screen::SnapshotsThinConfig,
+        );
+        return Ok(());
+    }
+    if app.fix_max_risk < RiskLevel::R3 {
+        open_error_return_to(
+            app,
+            format!(
+                "最大リスクが {} のため、snapshots thin（R3）を実行できません。\nヒント: 3 を押して R3 を含めてください。",
+                app.fix_max_risk
+            ),
+            Screen::SnapshotsThinConfig,
+        );
+        return Ok(());
+    }
+
+    let (bytes, urgency) = parse_snapshots_thin_inputs(app)?;
+
+    app.snapshots_thin_confirm = Some(SnapshotsThinConfirm {
+        stage: SnapshotsThinConfirmStage::Thin,
+        input: String::new(),
+        bytes,
+        urgency,
+        error: None,
+        return_to: Screen::SnapshotsThinConfig,
+        result_return_to: Screen::SnapshotsThinConfig,
+    });
+    app.screen = Screen::SnapshotsThinConfirm;
+    Ok(())
+}
+
+fn submit_snapshots_thin_confirm(app: &mut App, timeout: Duration) -> Result<()> {
+    if app.dry_run {
+        let return_to = app
+            .snapshots_thin_confirm
+            .as_ref()
+            .map(|c| c.return_to)
+            .unwrap_or(Screen::SnapshotsThinConfig);
+        open_error_return_to(
+            app,
+            "dry-run モード: snapshots thin は無効です。".to_string(),
+            return_to,
+        );
+        return Ok(());
+    }
+
+    let Some(confirm) = app.snapshots_thin_confirm.as_mut() else {
+        open_error_return_to(
+            app,
+            "確認状態がありません。".to_string(),
+            Screen::SnapshotsThinConfig,
+        );
+        return Ok(());
+    };
+
+    let expected = match confirm.stage {
+        SnapshotsThinConfirmStage::Thin => "thin",
+        SnapshotsThinConfirmStage::Yes => "yes",
+    };
+    if confirm.input.trim() != expected {
+        confirm.error = Some(format!("続行するには '{expected}' と入力してください。"));
+        return Ok(());
+    }
+
+    confirm.error = None;
+    confirm.input.clear();
+
+    match confirm.stage {
+        SnapshotsThinConfirmStage::Thin => {
+            confirm.stage = SnapshotsThinConfirmStage::Yes;
+        }
+        SnapshotsThinConfirmStage::Yes => {
+            let confirm = app.snapshots_thin_confirm.take().expect("confirm");
+            start_snapshots_thin_run(
+                app,
+                timeout,
+                confirm.bytes,
+                confirm.urgency,
+                confirm.result_return_to,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn start_snapshots_thin_run(
+    app: &mut App,
+    timeout: Duration,
+    bytes: u64,
+    urgency: u8,
+    return_to: Screen,
+) {
+    let home_dir = app.home_dir.clone();
+    let (tx, rx) = mpsc::channel::<Result<SnapshotsThinResult>>();
+    thread::spawn(move || {
+        let res = (|| -> Result<SnapshotsThinResult> {
+            let cmd = format!("$ tmutil thinlocalsnapshots / {bytes} {urgency}");
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = timeout;
+                return Ok(SnapshotsThinResult {
+                    bytes,
+                    urgency,
+                    cmd,
+                    exit_code: None,
+                    error: Some("snapshots thin は macOS のみ対応です。".to_string()),
+                    log_path: None,
+                    log_error: None,
+                    return_to,
+                });
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let args: Vec<String> = vec![
+                    "thinlocalsnapshots".to_string(),
+                    "/".to_string(),
+                    bytes.to_string(),
+                    urgency.to_string(),
+                ];
+
+                let started_at = time::OffsetDateTime::now_utc();
+                let attempt = crate::platform::macos::tmutil_thin_local_snapshots(
+                    "/",
+                    bytes,
+                    urgency,
+                    timeout,
+                );
+                let (output, attempt_error) = match attempt {
+                    Ok(output) => (Some(output), None),
+                    Err(err) => (None, Some(err.to_string())),
+                };
+                let finished_at = time::OffsetDateTime::now_utc();
+
+                let log_path = crate::logs::write_snapshots_thin_log(
+                    &home_dir,
+                    started_at,
+                    finished_at,
+                    bytes,
+                    urgency,
+                    "tmutil",
+                    &args,
+                    output.as_ref(),
+                    attempt_error.clone(),
+                );
+                let (log_path, log_error) = match log_path {
+                    Ok(p) => (Some(p), None),
+                    Err(err) => (None, Some(err.to_string())),
+                };
+
+                let exit_code = output.as_ref().map(|o| o.exit_code);
+                let error = if let Some(err) = attempt_error {
+                    Some(format!("`tmutil` の実行に失敗しました: {err}"))
+                } else if let Some(out) = output.as_ref() {
+                    if out.exit_code == 0 {
+                        None
+                    } else {
+                        let mut msg = format!(
+                            "コマンドが失敗しました（exit_code={}）。",
+                            out.exit_code
+                        );
+                        let stderr = out.stderr.trim();
+                        if !stderr.is_empty() {
+                            msg.push_str(&format!(" stderr:\n{stderr}"));
+                        } else {
+                            msg.push_str(" stderr は空でした。");
+                        }
+                        msg.push_str(
+                            "\nヒント: 権限エラーの場合は `sudo macdiet ui` を検討してください。",
+                        );
+                        Some(msg)
+                    }
+                } else {
+                    Some("コマンド出力がありません。".to_string())
+                };
+
+                Ok(SnapshotsThinResult {
+                    bytes,
+                    urgency,
+                    cmd,
+                    exit_code,
+                    error,
+                    log_path,
+                    log_error,
+                    return_to,
+                })
+            }
+        })();
+        let _ = tx.send(res);
+    });
+
+    app.pending_snapshots_thin = Some(PendingSnapshotsThin {
+        rx,
+        started_at: Instant::now(),
+    });
+    app.screen = Screen::Running;
+    app.error = None;
+}
+
+fn start_snapshots_delete_confirm(app: &mut App) -> Result<()> {
+    if app.dry_run {
+        open_error_return_to(
+            app,
+            "dry-run モード: snapshots delete は無効です。".to_string(),
+            Screen::SnapshotsDeleteSelect,
+        );
+        return Ok(());
+    }
+    if app.fix_max_risk < RiskLevel::R3 {
+        open_error_return_to(
+            app,
+            format!(
+                "最大リスクが {} のため、snapshots delete（R3）を実行できません。\nヒント: 3 を押して R3 を含めてください。",
+                app.fix_max_risk
+            ),
+            Screen::SnapshotsDeleteSelect,
+        );
+        return Ok(());
+    }
+
+    let indices = snapshots_delete_filtered_indices(&app.snapshots_delete_entries, &app.filter);
+    let Some(sel) = app.snapshots_delete_state.selected() else {
+        return Ok(());
+    };
+    let Some(idx) = indices.get(sel).copied() else {
+        open_error_return_to(
+            app,
+            "スナップショットが選択されていません。".to_string(),
+            Screen::SnapshotsDeleteSelect,
+        );
+        return Ok(());
+    };
+    let Some(entry) = app.snapshots_delete_entries.get(idx) else {
+        return Ok(());
+    };
+
+    let delete_cmd = format!("$ diskutil apfs deleteSnapshot / -uuid {}", entry.uuid);
+    app.snapshots_delete_confirm = Some(SnapshotsDeleteConfirm {
+        stage: SnapshotsDeleteConfirmStage::Delete,
+        input: String::new(),
+        uuid: entry.uuid.clone(),
+        delete_cmd,
+        error: None,
+        return_to: Screen::SnapshotsDeleteSelect,
+        result_return_to: Screen::SnapshotsDeleteSelect,
+    });
+    app.screen = Screen::SnapshotsDeleteConfirm;
+    Ok(())
+}
+
+fn submit_snapshots_delete_confirm(app: &mut App, timeout: Duration) -> Result<()> {
+    if app.dry_run {
+        let return_to = app
+            .snapshots_delete_confirm
+            .as_ref()
+            .map(|c| c.return_to)
+            .unwrap_or(Screen::SnapshotsDeleteSelect);
+        open_error_return_to(
+            app,
+            "dry-run モード: snapshots delete は無効です。".to_string(),
+            return_to,
+        );
+        return Ok(());
+    }
+
+    let Some(confirm) = app.snapshots_delete_confirm.as_mut() else {
+        open_error_return_to(
+            app,
+            "確認状態がありません。".to_string(),
+            Screen::SnapshotsDeleteSelect,
+        );
+        return Ok(());
+    };
+
+    let expected: String = match confirm.stage {
+        SnapshotsDeleteConfirmStage::Delete => "delete".to_string(),
+        SnapshotsDeleteConfirmStage::Uuid => confirm.uuid.clone(),
+    };
+    if confirm.input.trim() != expected.as_str() {
+        confirm.error = Some(format!("続行するには '{expected}' と入力してください。"));
+        return Ok(());
+    }
+
+    confirm.error = None;
+    confirm.input.clear();
+
+    match confirm.stage {
+        SnapshotsDeleteConfirmStage::Delete => {
+            confirm.stage = SnapshotsDeleteConfirmStage::Uuid;
+        }
+        SnapshotsDeleteConfirmStage::Uuid => {
+            let confirm = app.snapshots_delete_confirm.take().expect("confirm");
+            start_snapshots_delete_run(app, timeout, confirm.uuid, confirm.result_return_to);
+        }
+    }
+
+    Ok(())
+}
+
+fn start_snapshots_delete_run(app: &mut App, timeout: Duration, uuid: String, return_to: Screen) {
+    let home_dir = app.home_dir.clone();
+    let (tx, rx) = mpsc::channel::<Result<SnapshotsDeleteResult>>();
+    thread::spawn(move || {
+        let res = (|| -> Result<SnapshotsDeleteResult> {
+            let list_cmd_str = "diskutil apfs listSnapshots /";
+            let delete_cmd_str = format!("$ diskutil apfs deleteSnapshot / -uuid {uuid}");
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = timeout;
+                return Ok(SnapshotsDeleteResult {
+                    requested_id: uuid.clone(),
+                    resolved_uuid: Some(uuid),
+                    delete_cmd: delete_cmd_str,
+                    list_exit_code: None,
+                    delete_exit_code: None,
+                    error: Some("snapshots delete は macOS のみ対応です。".to_string()),
+                    log_path: None,
+                    log_error: None,
+                    return_to,
+                });
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let list_args: Vec<String> = vec![
+                    "apfs".to_string(),
+                    "listSnapshots".to_string(),
+                    "/".to_string(),
+                ];
+                let delete_args: Vec<String> = vec![
+                    "apfs".to_string(),
+                    "deleteSnapshot".to_string(),
+                    "/".to_string(),
+                    "-uuid".to_string(),
+                    uuid.clone(),
+                ];
+
+                let started_at = time::OffsetDateTime::now_utc();
+                let list_attempt =
+                    crate::platform::macos::diskutil_apfs_list_snapshots("/", timeout);
+                let (list_out, list_error) = match list_attempt {
+                    Ok(out) => (Some(out), None),
+                    Err(err) => (None, Some(err.to_string())),
+                };
+
+                let mut error = None::<String>;
+                let mut delete_out = None::<crate::platform::CommandOutput>;
+                let mut delete_error = None::<String>;
+                let mut attempted_delete = false;
+
+                if let Some(err) = list_error.as_deref() {
+                    error = Some(format!("`{list_cmd_str}` の実行に失敗しました: {err}"));
+                } else if let Some(out) = list_out.as_ref() {
+                    if out.exit_code != 0 {
+                        let mut msg = format!(
+                            "`{list_cmd_str}` が失敗しました（exit_code={}）",
+                            out.exit_code
+                        );
+                        let stderr = out.stderr.trim();
+                        if !stderr.is_empty() {
+                            msg.push_str(&format!("\nstderr:\n{stderr}"));
+                        }
+                        error = Some(msg);
+                    } else {
+                        let cat = crate::snapshots::parse_diskutil_apfs_list_snapshots(&out.stdout);
+                        if !cat.uuids.contains(&uuid.to_ascii_lowercase()) {
+                            error = Some(format!(
+                                "削除対象UUIDが diskutil の出力に見つかりませんでした: {uuid}"
+                            ));
+                        } else {
+                            attempted_delete = true;
+                            let attempt =
+                                crate::platform::macos::diskutil_apfs_delete_snapshot(
+                                    "/",
+                                    uuid.as_str(),
+                                    timeout,
+                                );
+                            match attempt {
+                                Ok(out) => delete_out = Some(out),
+                                Err(err) => delete_error = Some(err.to_string()),
+                            }
+                        }
+                    }
+                } else {
+                    error = Some("diskutil の出力がありません。".to_string());
+                }
+
+                if error.is_none() {
+                    if let Some(err) = delete_error.as_deref() {
+                        error = Some(format!(
+                            "`diskutil apfs deleteSnapshot` の実行に失敗しました: {err}"
+                        ));
+                    } else if let Some(out) = delete_out.as_ref() {
+                        if out.exit_code != 0 {
+                            let mut msg = format!(
+                                "コマンドが失敗しました（exit_code={}）。",
+                                out.exit_code
+                            );
+                            let stderr = out.stderr.trim();
+                            if !stderr.is_empty() {
+                                msg.push_str(&format!(" stderr:\n{stderr}"));
+                            }
+                            msg.push_str(
+                                "\nヒント: 権限エラーの場合は `sudo macdiet ui` を検討してください。",
+                            );
+                            error = Some(msg);
+                        }
+                    } else {
+                        error = Some("deleteSnapshot の出力がありません。".to_string());
+                    }
+                }
+
+                let finished_at = time::OffsetDateTime::now_utc();
+                let log_delete_cmd = if attempted_delete { Some("diskutil") } else { None };
+                let log_delete_args = if attempted_delete {
+                    Some(delete_args.as_slice())
+                } else {
+                    None
+                };
+                let log_path = crate::logs::write_snapshots_delete_log(
+                    &home_dir,
+                    started_at,
+                    finished_at,
+                    &uuid,
+                    Some(uuid.clone()),
+                    "diskutil",
+                    &list_args,
+                    list_out.as_ref(),
+                    list_error.clone(),
+                    log_delete_cmd,
+                    log_delete_args,
+                    delete_out.as_ref(),
+                    delete_error.clone(),
+                );
+                let (log_path, log_error) = match log_path {
+                    Ok(p) => (Some(p), None),
+                    Err(err) => (None, Some(err.to_string())),
+                };
+
+                let list_exit_code = list_out.as_ref().map(|o| o.exit_code);
+                let delete_exit_code = delete_out.as_ref().map(|o| o.exit_code);
+
+                Ok(SnapshotsDeleteResult {
+                    requested_id: uuid.clone(),
+                    resolved_uuid: Some(uuid),
+                    delete_cmd: delete_cmd_str,
+                    list_exit_code,
+                    delete_exit_code,
+                    error,
+                    log_path,
+                    log_error,
+                    return_to,
+                })
+            }
+        })();
+        let _ = tx.send(res);
+    });
+
+    app.pending_snapshots_delete = Some(PendingSnapshotsDelete {
+        rx,
+        started_at: Instant::now(),
+    });
+    app.screen = Screen::Running;
+    app.error = None;
+}
+
 fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let size = f.size();
 
@@ -2300,6 +3240,12 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         Screen::Home => draw_home(f, chunks[1], app),
         Screen::Running => draw_running(f, chunks[1], app),
         Screen::ScanConfig => draw_scan_config(f, chunks[1], app),
+        Screen::SnapshotsThinConfig => draw_snapshots_thin_config(f, chunks[1], app),
+        Screen::SnapshotsThinConfirm => draw_snapshots_thin_confirm(f, chunks[1], app),
+        Screen::SnapshotsThinResult => draw_snapshots_thin_result(f, chunks[1], app),
+        Screen::SnapshotsDeleteSelect => draw_snapshots_delete_select(f, chunks[1], app),
+        Screen::SnapshotsDeleteConfirm => draw_snapshots_delete_confirm(f, chunks[1], app),
+        Screen::SnapshotsDeleteResult => draw_snapshots_delete_result(f, chunks[1], app),
         Screen::LogsList => draw_logs_list(f, chunks[1], app),
         Screen::LogsDetail => draw_logs_detail(f, chunks[1], app),
         Screen::ReportView => draw_report(f, chunks[1], app),
@@ -2320,6 +3266,12 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect, app: &App) {
         Screen::Home => "macdiet — ホーム",
         Screen::Running => "macdiet — 実行中",
         Screen::ScanConfig => "macdiet — スキャン設定",
+        Screen::SnapshotsThinConfig => "macdiet — snapshots thin（R3）",
+        Screen::SnapshotsThinConfirm => "macdiet — snapshots thin（確認）",
+        Screen::SnapshotsThinResult => "macdiet — snapshots thin（結果）",
+        Screen::SnapshotsDeleteSelect => "macdiet — snapshots delete（R3）",
+        Screen::SnapshotsDeleteConfirm => "macdiet — snapshots delete（確認）",
+        Screen::SnapshotsDeleteResult => "macdiet — snapshots delete（結果）",
         Screen::LogsList => "macdiet — ログ",
         Screen::LogsDetail => "macdiet — ログ（詳細）",
         Screen::ReportView => "macdiet — レポート",
@@ -2384,7 +3336,11 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
             }
         }
         Screen::Running => {
-            if app.pending_apply.is_some() || app.pending_run_cmd.is_some() {
+            if app.pending_apply.is_some()
+                || app.pending_run_cmd.is_some()
+                || app.pending_snapshots_thin.is_some()
+                || app.pending_snapshots_delete.is_some()
+            {
                 ("（実行中）", "q 終了 | Ctrl-C 強制終了 | ? ヘルプ")
             } else {
                 (
@@ -2393,6 +3349,39 @@ fn draw_footer(f: &mut ratatui::Frame, area: Rect, app: &App) {
                 )
             }
         }
+        Screen::SnapshotsThinConfig => {
+            if app.snapshots_thin_edit_mode {
+                (
+                    "文字 編集 | Backspace 削除 | Enter/Esc 編集完了",
+                    "Ctrl-C 強制終了",
+                )
+            } else {
+                (
+                    "↑↓/j/k 選択 | Enter 編集 | x 実行 | 1/2/3 リスク | b/Esc 戻る",
+                    "q 終了 | Ctrl-C 強制終了 | ? ヘルプ",
+                )
+            }
+        }
+        Screen::SnapshotsThinConfirm => (
+            "Enter 送信 | Backspace 削除 | Esc キャンセル",
+            "q 終了 | Ctrl-C 強制終了 | ? ヘルプ",
+        ),
+        Screen::SnapshotsThinResult => (
+            "b/Esc 戻る | q 終了 | Ctrl-C 強制終了 | ? ヘルプ",
+            "ヒント: stdout/stderr はログ画面で確認できます",
+        ),
+        Screen::SnapshotsDeleteSelect => (
+            "↑↓/j/k 選択 | Enter/x 削除 | / フィルタ | r 更新 | 1/2/3 リスク | b/Esc 戻る",
+            "q 終了 | Ctrl-C 強制終了 | ? ヘルプ",
+        ),
+        Screen::SnapshotsDeleteConfirm => (
+            "Enter 送信 | Backspace 削除 | Esc キャンセル",
+            "q 終了 | Ctrl-C 強制終了 | ? ヘルプ",
+        ),
+        Screen::SnapshotsDeleteResult => (
+            "b/Esc 戻る | q 終了 | Ctrl-C 強制終了 | ? ヘルプ",
+            "ヒント: stdout/stderr はログ画面で確認できます",
+        ),
         Screen::ScanConfig => {
             if app.scan_edit_mode {
                 (
@@ -2570,7 +3559,17 @@ fn draw_home(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
             CommandKind::SnapshotsStatus => (
                 "スナップショット状態",
                 "Time Machine ローカルスナップショット + APFS スナップショットを表示します（ベストエフォート）。",
-                "注: thin/delete（R3）は、UI からはまだ実行できません。",
+                "注: thin/delete（R3）は「スナップショット thin/delete」から実行できます（強い同意が必要）。",
+            ),
+            CommandKind::SnapshotsThin => (
+                "スナップショット thin（R3）",
+                "tmutil thinlocalsnapshots を実行します（ローカルスナップショットの“薄め”）。",
+                "注: 影響が大きい可能性があります。必要なら `sudo macdiet ui` で実行してください。",
+            ),
+            CommandKind::SnapshotsDelete => (
+                "スナップショット delete（R3）",
+                "diskutil apfs deleteSnapshot を実行します（APFSスナップショット削除）。",
+                "注: まず Disk Utility のGUI削除を推奨します。実行には強い同意が必要です。",
             ),
             CommandKind::FixDryRun => (
                 "掃除（dry-run）",
@@ -2698,6 +3697,576 @@ fn draw_scan_config(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .block(Block::default().borders(Borders::ALL).title("詳細"))
         .wrap(Wrap { trim: false });
     f.render_widget(w, chunks[1]);
+}
+
+fn draw_snapshots_thin_config(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    App::move_list_selection(&mut app.snapshots_thin_state, 2, 0);
+    let sel = app.snapshots_thin_state.selected().unwrap_or(0);
+    let field_title = match sel {
+        0 => "bytes",
+        1 => "urgency",
+        _ => "bytes",
+    };
+
+    let edit_style = if app.snapshots_thin_edit_mode {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let bytes_preview = parse_size_input(&app.snapshots_thin_bytes_input).ok();
+    let urgency_preview = app
+        .snapshots_thin_urgency_input
+        .trim()
+        .parse::<u8>()
+        .ok()
+        .filter(|u| (1..=4).contains(u));
+
+    let bytes_label = bytes_preview
+        .map(crate::ui::format_bytes)
+        .unwrap_or_else(|| "（不正）".to_string());
+    let urgency_label = urgency_preview
+        .map(|u| u.to_string())
+        .unwrap_or_else(|| "（不正）".to_string());
+
+    let items = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled("bytes: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(app.snapshots_thin_bytes_input.clone()),
+            Span::raw("  "),
+            Span::styled(bytes_label, Style::default().fg(Color::DarkGray)),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("urgency: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(app.snapshots_thin_urgency_input.clone()),
+            Span::raw("  "),
+            Span::styled(urgency_label, Style::default().fg(Color::DarkGray)),
+        ])),
+    ];
+
+    let title = if app.snapshots_thin_edit_mode {
+        format!("snapshots thin（編集中: {field_title}）")
+    } else {
+        "snapshots thin（R3）".to_string()
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, chunks[0], &mut app.snapshots_thin_state);
+
+    let hint = if app.dry_run {
+        Span::styled(
+            "dry-run: snapshots thin は無効です",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if app.fix_max_risk < RiskLevel::R3 {
+        Span::styled(
+            "最大リスクが R3 未満のため実行できません（3 を押してください）",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "x で実行（確認へ）",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+
+    let preview_cmd = match (bytes_preview, urgency_preview) {
+        (Some(b), Some(u)) => format!("$ tmutil thinlocalsnapshots / {b} {u}"),
+        _ => "$ tmutil thinlocalsnapshots / <bytes> <urgency>".to_string(),
+    };
+
+    let mut detail_lines = Vec::<Line>::new();
+    detail_lines.push(Line::from(Span::styled(
+        "snapshots thin（R3）",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(vec![
+        Span::styled("最大リスク: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(app.fix_max_risk.to_string()),
+        Span::raw("  "),
+        hint,
+    ]));
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(vec![
+        Span::styled("選択中の項目: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(field_title, edit_style),
+    ]));
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(Span::styled(
+        "実行プレビュー:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    detail_lines.push(Line::from(preview_cmd));
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(Span::styled(
+        "注意:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    detail_lines.push(Line::from("- これは R3 です（影響が大きい可能性があります）。"));
+    detail_lines.push(Line::from(
+        "- 実行には `sudo macdiet ui` が必要な場合があります（環境により異なります）。",
+    ));
+    detail_lines.push(Line::from(
+        "- stdout/stderr の詳細はログ画面（~/.config/macdiet/logs/）で確認できます。",
+    ));
+
+    let w = Paragraph::new(Text::from(detail_lines))
+        .block(Block::default().borders(Borders::ALL).title("詳細"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, chunks[1]);
+}
+
+fn draw_snapshots_thin_confirm(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(confirm) = app.snapshots_thin_confirm.as_ref() else {
+        let w = Paragraph::new("確認状態がありません。")
+            .block(Block::default().borders(Borders::ALL).title("確認"));
+        f.render_widget(w, area);
+        return;
+    };
+
+    let prompt = match confirm.stage {
+        SnapshotsThinConfirmStage::Thin => "続行するには 'thin' と入力してください: ",
+        SnapshotsThinConfirmStage::Yes => "最終確認: 実行するには 'yes' と入力してください: ",
+    };
+
+    let mut lines = Vec::<Line>::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "snapshots thin（R3）",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "（影響が出る可能性があります）",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("bytes: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(confirm.bytes.to_string()),
+        Span::raw("  "),
+        Span::styled(crate::ui::format_bytes(confirm.bytes), Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        Span::styled("urgency: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(confirm.urgency.to_string()),
+    ]));
+    lines.push(Line::from(format!(
+        "$ tmutil thinlocalsnapshots / {} {}",
+        confirm.bytes, confirm.urgency
+    )));
+    lines.push(Line::from(Span::styled(
+        "注: 実行には `sudo macdiet ui` が必要な場合があります。",
+        Style::default().fg(Color::DarkGray),
+    )));
+    if let Some(err) = confirm.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            err,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(prompt, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            confirm.input.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let w = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title("確認"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, area);
+}
+
+fn draw_snapshots_thin_result(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(result) = app.snapshots_thin_result.as_ref() else {
+        let w = Paragraph::new("結果がありません。")
+            .block(Block::default().borders(Borders::ALL).title("結果"));
+        f.render_widget(w, area);
+        return;
+    };
+
+    let log_hint = result
+        .log_path
+        .as_ref()
+        .and_then(|p| p.strip_prefix(&app.home_dir).ok())
+        .map(|p| format!("~/{p}", p = p.display()))
+        .or_else(|| result.log_path.as_ref().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| "（ログなし）".to_string());
+
+    let status = if result.error.is_some() || result.exit_code != Some(0) {
+        Span::styled("ERROR", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("OK", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    };
+
+    let mut lines = Vec::<Line>::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "snapshots thin が完了しました",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("状態: ", Style::default().fg(Color::DarkGray)),
+        status,
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("exit_code: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(
+            result
+                .exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "（不明）".to_string()),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("bytes: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(result.bytes.to_string()),
+        Span::raw("  "),
+        Span::styled(crate::ui::format_bytes(result.bytes), Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        Span::styled("urgency: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(result.urgency.to_string()),
+    ]));
+    lines.push(Line::from(result.cmd.as_str()));
+    lines.push(Line::from(vec![
+        Span::styled("ログ: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(log_hint),
+    ]));
+    if let Some(err) = result.log_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("ログ書き込みエラー: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if let Some(err) = result.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            err,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "ヒント: stdout/stderr の詳細は「ログ」画面で確認できます。",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let w = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title("結果"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, area);
+}
+
+fn draw_snapshots_delete_select(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    let indices = snapshots_delete_filtered_indices(&app.snapshots_delete_entries, &app.filter);
+    App::move_list_selection(&mut app.snapshots_delete_state, indices.len(), 0);
+
+    let items: Vec<ListItem> = if app.snapshots_delete_entries.is_empty() {
+        vec![ListItem::new(Line::from("スナップショットが見つかりません。"))]
+    } else if indices.is_empty() {
+        vec![
+            ListItem::new(Line::from("一致するスナップショットがありません。")),
+            ListItem::new(Line::from(Span::styled(
+                "ヒント: '/' でフィルタを編集できます。",
+                Style::default().fg(Color::DarkGray),
+            ))),
+        ]
+    } else {
+        indices
+            .iter()
+            .filter_map(|idx| app.snapshots_delete_entries.get(*idx))
+            .map(|entry| {
+                let name_hint = entry
+                    .names
+                    .first()
+                    .map(|n| truncate_chars(n, 24))
+                    .unwrap_or_else(|| "".to_string());
+                let mut spans = vec![Span::styled(
+                    entry.uuid.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )];
+                if !name_hint.is_empty() {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        format!("({name_hint})"),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect()
+    };
+
+    let title = if app.filter.trim().is_empty() {
+        format!("スナップショット一覧（{}）", app.snapshots_delete_entries.len())
+    } else {
+        format!(
+            "スナップショット一覧（{shown}/{total}）",
+            shown = indices.len(),
+            total = app.snapshots_delete_entries.len()
+        )
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, chunks[0], &mut app.snapshots_delete_state);
+
+    let hint = if app.dry_run {
+        Span::styled(
+            "dry-run: snapshots delete は無効です",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if app.fix_max_risk < RiskLevel::R3 {
+        Span::styled(
+            "最大リスクが R3 未満のため削除できません（3 を押してください）",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "Enter/x で削除（確認へ）",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+
+    let detail = if let Some(sel) = app.snapshots_delete_state.selected() {
+        indices
+            .get(sel)
+            .and_then(|idx| app.snapshots_delete_entries.get(*idx))
+    } else {
+        None
+    };
+
+    let mut detail_lines = Vec::<Line>::new();
+    detail_lines.push(Line::from(Span::styled(
+        "snapshots delete（R3）",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(vec![
+        Span::styled("最大リスク: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(app.fix_max_risk.to_string()),
+        Span::raw("  "),
+        hint,
+    ]));
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(Span::styled(
+        "注意:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    detail_lines.push(Line::from("- まず Disk Utility のGUI削除を推奨します。"));
+    detail_lines.push(Line::from(
+        "- 実行には `sudo macdiet ui` が必要な場合があります（環境により異なります）。",
+    ));
+    detail_lines.push(Line::from(""));
+
+    if let Some(entry) = detail {
+        detail_lines.push(Line::from(vec![
+            Span::styled("UUID: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(entry.uuid.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        ]));
+        if !entry.names.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "関連名（diskutil出力）:",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            for n in entry.names.iter().take(6) {
+                detail_lines.push(Line::from(format!("- {n}")));
+            }
+            if entry.names.len() > 6 {
+                detail_lines.push(Line::from(Span::styled(
+                    "…（省略）",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        detail_lines.push(Line::from(""));
+        detail_lines.push(Line::from(Span::styled(
+            "実行プレビュー:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        detail_lines.push(Line::from(format!(
+            "$ diskutil apfs deleteSnapshot / -uuid {}",
+            entry.uuid
+        )));
+    } else if app.snapshots_delete_entries.is_empty() {
+        detail_lines.push(Line::from("この環境ではスナップショットを検出できませんでした。"));
+    } else {
+        detail_lines.push(Line::from("スナップショットが選択されていません。"));
+    }
+
+    let w = Paragraph::new(Text::from(detail_lines))
+        .block(Block::default().borders(Borders::ALL).title("詳細"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, chunks[1]);
+}
+
+fn draw_snapshots_delete_confirm(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(confirm) = app.snapshots_delete_confirm.as_ref() else {
+        let w = Paragraph::new("確認状態がありません。")
+            .block(Block::default().borders(Borders::ALL).title("確認"));
+        f.render_widget(w, area);
+        return;
+    };
+
+    let prompt = match confirm.stage {
+        SnapshotsDeleteConfirmStage::Delete => {
+            "snapshots delete は R3 です。続行するには 'delete' と入力してください: "
+        }
+        SnapshotsDeleteConfirmStage::Uuid => {
+            "最終確認: 削除するスナップショットUUIDをそのまま入力してください: "
+        }
+    };
+
+    let mut lines = Vec::<Line>::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "snapshots delete（R3）",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            "（影響が大きい可能性があります）",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("UUID: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(confirm.uuid.clone(), Style::default().add_modifier(Modifier::BOLD)),
+    ]));
+    lines.push(Line::from(confirm.delete_cmd.as_str()));
+    lines.push(Line::from(Span::styled(
+        "注: まず Disk Utility のGUI削除を推奨します。実行には `sudo macdiet ui` が必要な場合があります。",
+        Style::default().fg(Color::DarkGray),
+    )));
+    if let Some(err) = confirm.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            err,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(prompt, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            confirm.input.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    let w = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title("確認"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, area);
+}
+
+fn draw_snapshots_delete_result(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(result) = app.snapshots_delete_result.as_ref() else {
+        let w = Paragraph::new("結果がありません。")
+            .block(Block::default().borders(Borders::ALL).title("結果"));
+        f.render_widget(w, area);
+        return;
+    };
+
+    let log_hint = result
+        .log_path
+        .as_ref()
+        .and_then(|p| p.strip_prefix(&app.home_dir).ok())
+        .map(|p| format!("~/{p}", p = p.display()))
+        .or_else(|| result.log_path.as_ref().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| "（ログなし）".to_string());
+
+    let status = if result.error.is_some()
+        || result.list_exit_code != Some(0)
+        || result.delete_exit_code != Some(0)
+    {
+        Span::styled("ERROR", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("OK", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    };
+
+    let mut lines = Vec::<Line>::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            "snapshots delete が完了しました",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("状態: ", Style::default().fg(Color::DarkGray)),
+        status,
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("requested_id: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(result.requested_id.clone()),
+    ]));
+    if let Some(uuid) = result.resolved_uuid.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("resolved_uuid: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(uuid),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("list_exit_code: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(
+            result
+                .list_exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "（不明）".to_string()),
+        ),
+        Span::raw("  "),
+        Span::styled("delete_exit_code: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(
+            result
+                .delete_exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "（未実行）".to_string()),
+        ),
+    ]));
+    lines.push(Line::from(result.delete_cmd.as_str()));
+    lines.push(Line::from(vec![
+        Span::styled("ログ: ", Style::default().fg(Color::DarkGray)),
+        Span::raw(log_hint),
+    ]));
+    if let Some(err) = result.log_error.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("ログ書き込みエラー: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if let Some(err) = result.error.as_deref() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            err,
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "ヒント: stdout/stderr の詳細は「ログ」画面で確認できます。",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let w = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title("結果"))
+        .wrap(Wrap { trim: false });
+    f.render_widget(w, area);
 }
 
 fn draw_logs_list(f: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -2895,13 +4464,21 @@ fn draw_running(f: &mut ratatui::Frame, area: Rect, app: &App) {
         "適用中（TRASH_MOVE）..."
     } else if app.pending_run_cmd.is_some() {
         "実行中（許可リスト RUN_CMD）..."
+    } else if app.pending_snapshots_thin.is_some() {
+        "実行中（snapshots thin / R3）..."
+    } else if app.pending_snapshots_delete.is_some() {
+        "実行中（snapshots delete / R3）..."
     } else if app.pending_cleanup.is_some() {
         "個別削除候補を収集中..."
+    } else if app.pending_snapshots_delete_list.is_some() {
+        "スナップショット一覧を取得中..."
     } else {
         match app.pending.as_ref().map(|p| p.kind) {
             Some(CommandKind::Doctor) => "診断を実行中...",
             Some(CommandKind::ScanDeep) => "スキャン（深掘り）を実行中...",
             Some(CommandKind::SnapshotsStatus) => "スナップショット状態を取得中...",
+            Some(CommandKind::SnapshotsThin) => "snapshots thin を準備中...",
+            Some(CommandKind::SnapshotsDelete) => "snapshots delete を準備中...",
             Some(CommandKind::FixDryRun) => "掃除プラン（dry-run）を作成中...",
             Some(CommandKind::Utilities) => "ユーティリティを準備中...",
             Some(CommandKind::Logs) => "ログを読み込み中...",
@@ -4410,6 +5987,19 @@ fn logs_filtered_indices(entries: &[LogEntry], filter: &str) -> Vec<usize> {
         .collect()
 }
 
+fn snapshots_delete_filtered_indices(entries: &[SnapshotDeleteEntry], filter: &str) -> Vec<usize> {
+    let tokens = filter_tokens(filter);
+    if tokens.is_empty() {
+        return (0..entries.len()).collect();
+    }
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches_filter(&e.search_text, &tokens))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 fn action_search_text(action: &crate::core::ActionPlan) -> String {
     let mut out = String::new();
     out.push_str(&action.id);
@@ -4734,7 +6324,7 @@ fn draw_error(f: &mut ratatui::Frame, area: Rect, app: &App) {
 fn draw_help(f: &mut ratatui::Frame, area: Rect, _app: &App) {
     let text = Text::from(vec![
         Line::from(Span::styled(
-            "macdiet UI（Phase 7）",
+            "macdiet UI（Phase 10）",
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -4769,6 +6359,14 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect, _app: &App) {
         Line::from("スキャン（設定）:"),
         Line::from("  ↑↓/j/k: 項目選択  Enter: 編集  r: 実行  b: 戻る"),
         Line::from(""),
+        Line::from("スナップショット thin（R3）:"),
+        Line::from("  ↑↓/j/k: 項目選択  Enter: 編集  x: 実行  1/2/3: 最大リスク  b: 戻る"),
+        Line::from("  （確認）thin → yes（typed confirm）"),
+        Line::from(""),
+        Line::from("スナップショット delete（R3）:"),
+        Line::from("  ↑↓/j/k: 選択  Enter/x: 削除（確認）  /: フィルタ  r: 更新  1/2/3: 最大リスク  b: 戻る"),
+        Line::from("  （確認）delete → <uuid>（typed confirm）"),
+        Line::from(""),
         Line::from("ログ:"),
         Line::from("  ↑↓/j/k: 選択  Enter: 開く  r: 更新  b: 戻る"),
         Line::from("  /  : フィルタ（一覧を絞り込み）"),
@@ -4785,6 +6383,7 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect, _app: &App) {
         Line::from(
             "  RUN_CMD の実行は厳格な許可リストに限定されます（例: `brew cleanup`, `npm cache clean --force`, `docker system prune`, `xcrun simctl delete unavailable`）。",
         ),
+        Line::from("  snapshots thin/delete は R3 です（強い同意が必要。必要なら `sudo macdiet ui`）。"),
         Line::from("  --dry-run で起動した場合、破壊的操作は無効です。"),
         Line::from(""),
         Line::from("確認入力（typed confirm）:"),
@@ -4801,6 +6400,20 @@ fn open_scan_config(app: &mut App) {
     app.scan_edit_mode = false;
     app.scan_config_state.select(Some(0));
     app.screen = Screen::ScanConfig;
+}
+
+fn open_snapshots_thin_config(app: &mut App) {
+    app.snapshots_thin_edit_mode = false;
+    app.snapshots_thin_state.select(Some(0));
+    app.snapshots_thin_confirm = None;
+    app.snapshots_thin_result = None;
+    app.screen = Screen::SnapshotsThinConfig;
+}
+
+fn open_snapshots_delete_select(app: &mut App, timeout: Duration) {
+    app.snapshots_delete_confirm = None;
+    app.snapshots_delete_result = None;
+    start_snapshots_delete_list_refresh(app, timeout);
 }
 
 fn open_logs(app: &mut App) {
@@ -4972,11 +6585,24 @@ fn scan_field_mut(app: &mut App) -> &mut String {
     }
 }
 
+fn snapshots_thin_field_mut(app: &mut App) -> &mut String {
+    match app.snapshots_thin_state.selected().unwrap_or(0) {
+        0 => &mut app.snapshots_thin_bytes_input,
+        1 => &mut app.snapshots_thin_urgency_input,
+        _ => &mut app.snapshots_thin_bytes_input,
+    }
+}
+
 fn trim_scan_inputs(app: &mut App) {
     app.scan_scope_input = app.scan_scope_input.trim().to_string();
     app.scan_max_depth_input = app.scan_max_depth_input.trim().to_string();
     app.scan_top_dirs_input = app.scan_top_dirs_input.trim().to_string();
     app.scan_exclude_input = app.scan_exclude_input.trim().to_string();
+}
+
+fn trim_snapshots_thin_inputs(app: &mut App) {
+    app.snapshots_thin_bytes_input = app.snapshots_thin_bytes_input.trim().to_string();
+    app.snapshots_thin_urgency_input = app.snapshots_thin_urgency_input.trim().to_string();
 }
 
 fn start_scan_from_inputs(app: &mut App, engine: Engine) {
@@ -5032,6 +6658,118 @@ fn parse_scan_request_from_inputs(app: &App) -> Result<ScanRequest> {
         exclude,
         show_progress: false,
     })
+}
+
+fn parse_size_input(input: &str) -> Result<u64> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err(anyhow::anyhow!("サイズが空です"));
+    }
+
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| *c != '_' && *c != ',' && !c.is_whitespace())
+        .collect();
+    if cleaned.is_empty() {
+        return Err(anyhow::anyhow!("サイズが空です"));
+    }
+
+    let mut split_at = cleaned.len();
+    for (i, ch) in cleaned.char_indices() {
+        if ch.is_ascii_alphabetic() {
+            split_at = i;
+            break;
+        }
+    }
+
+    let (num_part, unit_part) = cleaned.split_at(split_at);
+    if num_part.is_empty() {
+        return Err(anyhow::anyhow!("サイズの数値部分がありません: {raw}"));
+    }
+    let num = num_part
+        .parse::<u64>()
+        .with_context(|| format!("サイズは数値で指定してください: {raw}"))?;
+
+    let unit = unit_part.to_ascii_lowercase();
+    let multiplier: u64 = match unit.as_str() {
+        "" | "b" => 1,
+        "k" | "ki" | "kib" => 1024,
+        "m" | "mi" | "mib" => 1024_u64.pow(2),
+        "g" | "gi" | "gib" => 1024_u64.pow(3),
+        "t" | "ti" | "tib" => 1024_u64.pow(4),
+        "kb" => 1000,
+        "mb" => 1000_u64.pow(2),
+        "gb" => 1000_u64.pow(3),
+        "tb" => 1000_u64.pow(4),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "サイズの単位が不明です: {raw}（例: 50GB / 50GiB / 50000000000）"
+            ));
+        }
+    };
+
+    num.checked_mul(multiplier)
+        .ok_or_else(|| anyhow::anyhow!("サイズが大きすぎます: {raw}"))
+}
+
+fn parse_snapshots_thin_inputs(app: &App) -> Result<(u64, u8)> {
+    let bytes = parse_size_input(&app.snapshots_thin_bytes_input).context(
+        "snapshots thin: bytes の形式が不正です（例: 50000000000 / 50GB / 50GiB）",
+    )?;
+    if bytes == 0 {
+        return Err(anyhow::anyhow!(
+            "snapshots thin: bytes は 0 より大きい必要があります"
+        ));
+    }
+
+    let urgency = app
+        .snapshots_thin_urgency_input
+        .trim()
+        .parse::<u8>()
+        .context("snapshots thin: urgency は 1..=4 の数値で指定してください")?;
+    if !(1..=4).contains(&urgency) {
+        return Err(anyhow::anyhow!(
+            "snapshots thin: urgency は 1..=4 で指定してください"
+        ));
+    }
+
+    Ok((bytes, urgency))
+}
+
+fn build_snapshot_delete_entries(stdout: &str) -> Vec<SnapshotDeleteEntry> {
+    let cat = crate::snapshots::parse_diskutil_apfs_list_snapshots(stdout);
+
+    use std::collections::BTreeMap;
+    let mut uuid_to_names = BTreeMap::<String, Vec<String>>::new();
+    for (name, uuids) in &cat.name_to_uuids {
+        for uuid in uuids {
+            uuid_to_names
+                .entry(uuid.clone())
+                .or_default()
+                .push(name.clone());
+        }
+    }
+
+    let mut out = Vec::<SnapshotDeleteEntry>::new();
+    for uuid in &cat.uuids {
+        let mut names = uuid_to_names.remove(uuid).unwrap_or_default();
+        names.sort();
+        names.dedup();
+
+        let mut search_text = uuid.clone();
+        for n in &names {
+            search_text.push(' ');
+            search_text.push_str(n);
+        }
+
+        out.push(SnapshotDeleteEntry {
+            uuid: uuid.clone(),
+            names,
+            search_text,
+        });
+    }
+
+    out
 }
 
 fn default_scan_request(app: &App) -> ScanRequest {
@@ -6260,5 +7998,34 @@ mod tests {
         assert!(err
             .to_string()
             .contains("タイムアウト予算が 0 のため"));
+    }
+
+    #[test]
+    fn parse_size_input_accepts_units_and_separators() {
+        assert_eq!(parse_size_input("1_000").expect("bytes"), 1000);
+        assert_eq!(parse_size_input("1GiB").expect("gib"), 1024_u64.pow(3));
+        assert_eq!(parse_size_input("1GB").expect("gb"), 1000_u64.pow(3));
+        assert_eq!(parse_size_input("2 MiB").expect("mib"), 2 * 1024_u64.pow(2));
+    }
+
+    #[test]
+    fn build_snapshot_delete_entries_extracts_uuids_and_names() {
+        let sample = r#"
+Snapshots for disk1s1 (2 found)
+|
++-- 01234567-89AB-CDEF-0123-456789ABCDEF
+    Name: com.apple.TimeMachine.2026-01-01-000000.local
+    Snapshot UUID: 89abcdef-0123-4567-89ab-cdef01234567
+"#;
+        let entries = build_snapshot_delete_entries(sample);
+        assert_eq!(entries.len(), 2);
+        for e in entries {
+            assert!(crate::snapshots::is_uuid(&e.uuid));
+            assert!(!e.names.is_empty());
+            assert!(e
+                .names
+                .iter()
+                .any(|n| n.contains("com.apple.TimeMachine.2026-01-01-000000.local")));
+        }
     }
 }
