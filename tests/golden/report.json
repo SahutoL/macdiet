@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+  "tool_version": "0.1.0",
+  "os": { "name": "macOS", "version": "26.x" },
+  "generated_at": "2026-01-01T00:00:00Z",
+  "summary": { "estimated_total_bytes": 123, "unobserved_bytes": 0, "notes": ["note-1"] },
+  "findings": [
+    {
+      "id": "f-1",
+      "type": "XCODE_DERIVED_DATA_LARGE",
+      "title": "Xcode DerivedData",
+      "estimated_bytes": 123,
+      "confidence": 0.9,
+      "risk_level": "R1",
+      "evidence": [
+        { "kind": "path", "value": "~/Library/Developer/Xcode/DerivedData", "masked": true },
+        { "kind": "stat", "value": "files=1 errors=0", "masked": false }
+      ],
+      "recommended_actions": [{ "id": "a-1" }]
+    }
+  ],
+  "actions": [
+    {
+      "id": "a-1",
+      "title": "Delete DerivedData via Xcode UI",
+      "risk_level": "R1",
+      "estimated_reclaimed_bytes": 0,
+      "related_findings": ["f-1"],
+      "kind": { "kind": "SHOW_INSTRUCTIONS", "markdown": "markdown" },
+      "notes": []
+    }
+  ]
+}
+
